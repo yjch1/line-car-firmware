@@ -35,16 +35,54 @@
 
 ## 版本管理
 
-整个目录是 git 仓库（`main` 分支）。
+整个目录是 git 仓库（`main` 分支），已提交：
+
+```
+a9b540a chore: 补齐 git 骨架（.gitignore / .gitattributes 锁 LF，日志文件不入库）
+ee271ac refactor: 拆分为两条固件线（ultrasonic / whisker）+ archive 历史快照
+dbc12b4 baseline: 初始状态 + 历史快照与文档
+```
+
+常用命令：
 
 ```powershell
 git log --oneline          # 看历史
 git status --short         # 看谁改了文件（另一个工具改了也会显示）
-git diff                   # 看具体改了哪几行
-git checkout -- <文件>     # 丢弃改动、退回上次提交
+git diff                   # 看工作区具体改了哪几行
+git diff --cached          # 看已暂存、还没提交的内容
+git checkout -- <文件>     # 丢弃某个文件的改动，退回上次提交
+git revert <提交号>        # 撤销某次提交（保留历史，安全）
 ```
 
-**改代码前先 `git add -A; git commit`**，这样任何一次"越改越烂"都能一条命令退回。
+**改代码前先 `git add -A; git commit -m "..."`**，这样任何一次"越改越烂"都能一条命令退回。
+
+### 两个必须保留的配置文件
+
+| 文件 | 作用 |
+|---|---|
+| `.gitattributes` | **把所有文本文件锁成 LF**。本机系统级 `core.autocrlf=true`，没有它，git 每次 checkout 都会把 `.ino` 从 LF 改成 CRLF —— 文件字节数变化，和 Arduino 存档、历史快照全部 diff 变红，`git checkout` 也就不再等于"精确恢复"。 |
+| `.gitignore` | 忽略编译产物（`*.hex/*.elf/*.map/*.o`）、工具日志（`.knowcode/`）、临时目录、Windows 垃圾文件。 |
+
+### 推到 GitHub
+
+仓库名建议别叫 `2`，先改名（git 不受影响）：
+
+```powershell
+Rename-Item 'D:\GitHub\2' 'D:\GitHub\line-car-firmware'
+```
+
+然后在 GitHub 网页上新建一个**空仓库**（不要勾 README/gitignore），再回来：
+
+```powershell
+cd D:\GitHub\line-car-firmware
+git remote add origin https://github.com/<你的用户名>/<仓库名>.git
+git branch -M main
+git push -u origin main
+```
+
+首次推送会弹出浏览器登录（本机装了 Git Credential Manager，不用手搓 token）。
+若 GitHub 访问慢，可换 SSH（`git remote set-url origin git@github.com:...`）或推到极狐 / Gitee。
+
 
 ## 其它目录
 
