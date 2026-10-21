@@ -1,0 +1,590 @@
+/* ============================================================================
+ *  循迹小车 · 双轮编码器速度环 PID 版
+ *  ---------------------------------------------------------------------------
+ *  接线
+ *    循迹传感器 : 左 A4      中 D3      右 A5
+ *    左轮驱动   : Motor-1 → 正转 D6    反转 D5
+ *    右轮驱动   : Motor-0 → 正转 D10   反转 D9
+ *    编码器     : 左 A3(PCINT11)   右 A2(PCINT10)
+ *    超声波     : TRIG D14   ECHO D15
+ *  ---------------------------------------------------------------------------
+ *  结构（从下往上三层）
+ *    ① 底层：motorLR(左PWM, 右PWM)  —— 唯一直接写电机引脚的地方
+ *    ② 中层：每 20ms 一次「测速 → 双轮 PID → PWM」  ← 本版新增，就是它让车走得直
+ *    ③ 上层：du()/move_tai() 状态机 —— 只管设目标速度 tgtL / tgtR，不再直接写 PWM
+ *  ---------------------------------------------------------------------------
+ *  串口调参（115200，每行一条，回车结束）
+ *    30        → 基础速度改成 30 cm/s（也可以 S30）
+ *    P4.5      → 改 Kp        I10 → 改 Ki       D0.05 → 改 Kd
+ *    T22       → 改原地转弯速度      Z12 → 改 zhi 对正差速
+ * ========================================================================== */
+
+#include <math.h>
+
+/* ---------------- 硬件引脚 ---------------- */
+#define TRIGPIN 14
+#define ECHOPIN 15
+
+/* ---------------- 机械参数（按你的实车核对！） ---------------- */
+#define ENC_EDGES_PER_REV 30       // 码盘 15 孔 → 转一圈 30 个边沿（上升沿+下降沿）
+#define WHEEL_DIA_CM      5.0      // 轮子直径 5cm
+// 一个脉冲对应车走了多远：π*D / 一圈脉冲数 = 3.1416*5/30 = 0.5236 cm
+#define CM_PER_EDGE (3.14159265 * WHEEL_DIA_CM / (double)ENC_EDGES_PER_REV)
+
+/* ---------------- 速度环参数 ---------------- */
+#define CTRL_PERIOD_MS 20       // 速度环周期 20ms（50Hz），够快也不浪费算力
+#define SPEED_LP       0.50     // 测速一阶低通，越大跟得越快、越抖（0.3~0.7 之间调）
+#define STALL_US       150000UL // 超过 150ms 没有新脉冲 → 认为这个轮子停了
+#define PWM_MAX        255
+#define PWM_MIN        0        // 电机启动死区。低速轮子不转、PID 输出 20 干着急时填这里（一般 40~70）
+
+/* ---------------- PID 出厂参数（先按这个跑，再照现象调） ---------------- */
+double kp = 4.0;                // 比例：拉速度的力度
+double ki = 10.0;               // 积分：消稳态误差（车到不了目标速度就加它）
+double kd = 0.0;                // 微分：编码器分辨率粗，D 一般别开，最多 0.05 级别
+
+/* ---------------- 运行参数（可串口在线改） ---------------- */
+double baseSpeed = 30.0;        // 直行基础速度 cm/s
+double turnSpeed = 22.0;        // 原地转弯速度 cm/s
+double zhiDelta  = 12.0;        // zhi() 对正时左右轮的速度差 cm/s
+
+/* ========================= 1. 编码器 =========================
+ * 用引脚变化中断(PCINT)数脉冲，顺便量出"相邻两个脉冲之间的时间"。
+ *
+ * 为什么不用轮询那一套？
+ *   15 孔码盘一圈才 30 个脉冲，等于 0.52cm 才有一次计数。
+ *   如果按"50ms 窗口里数到几个脉冲"来算速度，30cm/s 时窗口里只有 3 个脉冲，
+ *   分辨率就是 ±10cm/s，PID 会被这个量化台阶搞疯。
+ *   所以这里改成测周期：速度 = 0.5236cm / 两个脉冲的间隔时间，
+ *   micros() 精度 4us，测速分辨率立刻拉满。
+ * ========================================================== */
+volatile long          encCntL = 0, encCntR = 0;   // 累计脉冲（带符号，用来算里程）
+volatile unsigned long encDtL  = 0, encDtR  = 0;   // 相邻两个边沿的间隔(us)
+volatile unsigned long encTmL  = 0, encTmR  = 0;   // 上一个边沿发生的时刻(us)
+volatile uint8_t       pcLast  = 0;
+volatile int8_t        dirL = 1, dirR = 1;         // 当前指令方向 +1正转 -1反转
+
+// 单路编码器分不出转向，所以脉冲的正负用"当前指令方向"来定 —— 这点后面讲
+ISR(PCINT1_vect)
+{
+    unsigned long now = micros();
+    uint8_t cur = PINC;
+    uint8_t chg = cur ^ pcLast;
+    pcLast = cur;
+
+    if(chg & _BV(PC2))                 // A2 → 右编码器
+    {
+        encDtR = now - encTmR;
+        encTmR = now;
+        encCntR += dirR;
+    }
+    if(chg & _BV(PC3))                 // A3 → 左编码器
+    {
+        encDtL = now - encTmL;
+        encTmL = now;
+        encCntL += dirL;
+    }
+}
+
+/* 由"脉冲间隔"换算速度(cm/s)，顺带处理停转 */
+double readSpeedCmps(volatile unsigned long *dt, volatile unsigned long *tm)
+{
+    // ★ 修补：encDt/encTm 是 4 字节变量、在中断里被整体改写，
+    //   主循环直接读有可能读到"前两字节是新的、后两字节是旧的"（撕裂读）。
+    //   一旦撕裂，age 会大得离谱 → 测速瞬间掉到 0 → PID 当场抽一下。
+    //   所以先关中断把两个值快照出来再算。关中断只有几条指令，不会丢脉冲。
+    unsigned long d, tmSnap;
+    noInterrupts();
+    d      = *dt;
+    tmSnap = *tm;
+    interrupts();
+
+    unsigned long age = micros() - tmSnap;    // 距最后一个脉冲过去多久
+    unsigned long t   = (d > age) ? d : age;  // 取大者：停转时会随 age 平滑掉到 0
+
+    if(t == 0 || t >= STALL_US) return 0.0;
+    return CM_PER_EDGE * 1000000.0 / (double)t;
+}
+
+/* ========================= 2. 手写 PID =========================
+ * 就是你贴的那条式子离散化：out = Kp*e + Ki*∫e dt + Kd*de/dt
+ * 写成手写版是为了不依赖 PID_v1 库（省得装库报错），也方便看清每一项在干嘛。
+ * ========================================================== */
+struct PIDCtl
+{
+    double kp, ki, kd;
+    double iTerm;      // 积分累加项
+    double lastIn;     // 上一拍测量值（微分作用在测量值上，避免设定值突变时爆冲）
+    int8_t lastSign;   // 上一拍目标速度的符号
+
+    void reset() { iTerm = 0; lastIn = 0; }
+
+    void setGains(double p, double i, double d) { kp = p; ki = i; kd = d; }
+
+    double compute(double setpoint, double input, double dtSec)
+    {
+        // ★ 目标换向（比如原地转弯时右轮由正转变反转）→ 清积分，
+        //   否则上一方向的积分会顶着车往反方向冲
+        int8_t sgn = (setpoint >= 0) ? 1 : -1;
+        if(sgn != lastSign) { iTerm = 0; lastSign = sgn; }
+
+        double e = setpoint - input;
+
+        iTerm += ki * e * dtSec;
+        if(iTerm >  PWM_MAX) iTerm =  PWM_MAX;   // 抗积分饱和，否则会"想起来才刹车"
+        if(iTerm < -PWM_MAX) iTerm = -PWM_MAX;
+
+        double d = (dtSec > 0) ? kd * (input - lastIn) / dtSec : 0.0;
+        lastIn = input;
+
+        double out = kp * e + iTerm - d;
+        if(out >  PWM_MAX) out =  PWM_MAX;
+        if(out < -PWM_MAX) out = -PWM_MAX;
+        return out;
+    }
+};
+
+PIDCtl pidL = {0, 0, 0, 0, 0, 1};
+PIDCtl pidR = {0, 0, 0, 0, 0, 1};
+
+/* ========================= 3. 电机输出层 =========================
+ * 唯一直接写电机引脚的地方。pwmL / pwmR 是带符号 PWM：
+ *   正数 = 正转，负数 = 反转，0 = 松开
+ *
+ * ★★★ 左右是怎么定的（上一版我定错了，转弯方向反了就是这里）
+ *   原地左转 = 左轮倒转 + 右轮正转，原地右转反过来。
+ *   你原来的 L() 是「M0 正转 + M1 倒转」，被倒转的那一路就是左轮，
+ *   所以 **左轮 = M1(D6/D5)，右轮 = M0(D10/D9)**。
+ *   上一版我把 M0 当左轮，结果 L() 全反了 —— 已修正。
+ * ========================================================== */
+void motorLR(int pwmL, int pwmR)
+{
+    // 左轮 = Motor-1 : D6 正转 / D5 反转
+    if(pwmL >= 0) { analogWrite(6,  pwmL);  analogWrite(5, 0);      dirL =  1; }
+    else          { analogWrite(6,  0);     analogWrite(5, -pwmL);  dirL = -1; }
+
+    // 右轮 = Motor-0 : D10 正转 / D9 反转
+    if(pwmR >= 0) { analogWrite(10, pwmR);  analogWrite(9, 0);      dirR =  1; }
+    else          { analogWrite(10, 0);     analogWrite(9, -pwmR);  dirR = -1; }
+}
+
+/* ========================= 4. 上层动作：只设目标速度 ========================= */
+double tgtL = 0, tgtR = 0;      // 左右轮目标速度 cm/s（带符号）
+double spdL = 0, spdR = 0;      // 实测速度 cm/s（低通后）
+int    pwmOutL = 0, pwmOutR = 0;
+
+void qian() { tgtL =  baseSpeed;              tgtR =  baseSpeed;             }  // 直行
+void hou()  { tgtL = -baseSpeed * 0.7;        tgtR = -baseSpeed * 0.7;       }  // 后退
+void L()    { tgtL = -turnSpeed;              tgtR =  turnSpeed;             }  // 原地左转
+void R()    { tgtL =  turnSpeed;              tgtR = -turnSpeed;             }  // 原地右转
+// ★ zhi 对正：q==110 说明黑线压在中+左探头下（车偏在线的右侧），
+//   要往左修 → 右轮快、左轮慢。串口发个负数（Z-12）就能当场反方向验证
+void zhi()  { tgtL =  baseSpeed - zhiDelta/2; tgtR = baseSpeed + zhiDelta/2; }
+
+// ★ 停车：目标清零 + 立刻松开引脚（不等 PID 那 20ms），紧急情况要的就是快
+void ting()
+{
+    tgtL = 0; tgtR = 0;
+    motorLR(0, 0);
+    pidL.reset();
+    pidR.reset();
+}
+
+/* ========================= 5. 速度环：测速 → PID → PWM ========================= */
+void updateSpeedPID()
+{
+    static unsigned long last = 0;
+    unsigned long now = millis();
+    if(now - last < CTRL_PERIOD_MS) return;
+
+    double dt = (now - last) / 1000.0;
+    last = now;
+
+    // ① 测速（乘上指令方向得到带符号的速度）
+    double sL = readSpeedCmps(&encDtL, &encTmL) * dirL;
+    double sR = readSpeedCmps(&encDtR, &encTmR) * dirR;
+
+    // ② 一阶低通：滤掉码盘开孔误差带来的抖动
+    spdL += SPEED_LP * (sL - spdL);
+    spdR += SPEED_LP * (sR - spdR);
+
+    // ③ 两个轮子各跑一个 PID。目标一样、参数一样 → 两轮转速一致 → 车就直
+    if(tgtL == 0 && tgtR == 0)
+    {
+        pwmOutL = pwmOutR = 0;
+    }
+    else
+    {
+        double oL = pidL.compute(tgtL, spdL, dt);
+        double oR = pidR.compute(tgtR, spdR, dt);
+
+        // 电机启动死区补偿（PWM_MIN = 0 时不生效）
+        if(oL > 0 && oL < PWM_MIN) oL = PWM_MIN;
+        if(oL < 0 && oL > -PWM_MIN) oL = -PWM_MIN;
+        if(oR > 0 && oR < PWM_MIN) oR = PWM_MIN;
+        if(oR < 0 && oR > -PWM_MIN) oR = -PWM_MIN;
+
+        pwmOutL = (int)oL;
+        pwmOutR = (int)oR;
+    }
+    motorLR(pwmOutL, pwmOutR);
+}
+
+/* ========================= 6. 循迹状态机（原逻辑保留） ========================= */
+int a = 0, b = 0, c = 0;
+int q = 0;
+int fq = 0;
+
+bool heiLocked = false;
+unsigned long heiStart = 0;
+
+// ★★★ 黑块（111）处理策略 —— 就是你要的"看到 111 就 qian()，走 3 秒"
+//   语义：q==111 = 黑块/交叉口 → 直行冲过去。
+//   连续 111 超过 HEI_DEBOUNCE_MS 后进入"锁定直行"：接下来最长 3 秒完全不理
+//   循迹读数（免得过黑块时探头抖一下把车带偏）；探头连续离开黑块 HEI_EXIT_MS
+//   才提前收工，恢复正常循迹。走满 3 秒还没出去 → 自动再开一段（不会卡死）。
+#define HEI_DURATION    3000UL   // 每段锁定直行的时长：3 秒
+#define HEI_DEBOUNCE_MS 50       // 111 必须连续保持这么久，才算真黑块
+#define HEI_MIN_MS      150      // 锁定期前 150ms 内不判"离开"，避免刚进就退
+#define HEI_EXIT_MS     100      // 探头要连续离开黑块这么久，才算真离开
+
+bool          heiArmed     = true;
+bool          q111Active   = false;
+unsigned long q111Start    = 0;
+unsigned long heiLeaveStart = 0;   // 探头开始"离开黑块"的时刻，0 = 当前还在黑块上
+
+bool zhiLocked = false;
+
+// ★ 超声波状态锁：hei 动作执行期间上锁，动作完成后解锁
+bool ultraLocked = false;
+
+// ★★★ 超声波停车锁
+//   老代码把 STOP() 排在 move_tai() 后面，只是在末尾把引脚擦一遍，
+//   下一轮 loop 开头 move_tai() 又立刻拉满 PWM —— 电机只被"闪"一下，
+//   平均输出仍接近全速，看起来就是压根没停。停车必须做成锁。
+bool stopLocked = false;
+
+// ★ 超声波停车阈值（厘米）：距离 <= STOP_MAX 即停车
+//   老代码用 [13,17] 这个"带"，车稍快就会从 >17 一步跨到 <13，掉出窗口就再也不停
+#define STOP_MAX 17
+#define STOP_CLEAR_COUNT 2       // 连续 N 次测不到障碍才放行
+
+// ★★★ 响应速度参数
+//   ECHO_TIMEOUT_US 是 pulseIn 的总超时，含"等 ECHO 拉高"的模块响应延迟(几百us)，
+//   1200us 扣掉延迟只够测到 ~15cm，17cm 附近常被判成超时 → 当成无障碍放行。
+#define ECHO_TIMEOUT_US   2000UL
+#define ULTRA_INTERVAL_US 20000UL
+#define ZHI_TIMEOUT_MS    400
+
+volatile float distance = 999;
+int ultraState = 0;
+unsigned long trigTime = 0;
+unsigned long zhiStart = 0;
+
+void du()
+{
+    if      (b == 1 && a == 0 && c == 0)  q = 10;
+    else if (a == 0 && b == 0 && c == 0)  q = fq;
+    else if (a == 1 && b == 0 && c == 0)  q = 100;
+    else if (a == 0 && b == 0 && c == 1)  q = 1;
+    else if (a == 0 && b == 1 && c == 1)  q = 1;
+    else if (a == 1 && b == 1 && c == 0)  q = 110;
+    else if (a == 1 && b == 1 && c == 1)  q = 111;
+    else                                   q = 0;
+}
+
+void hei()
+{
+    if(!heiLocked)
+    {
+        heiLocked = true;
+        heiStart  = millis();
+    }
+    ultraLocked = true;   // hei 动作期间屏蔽超声波停车
+}
+
+void move_tai()
+{
+    // ★ 优先级：hei 黑块直行 > 超声波停车 > zhi 对正 > 普通循迹
+    if(heiLocked)
+    {
+        unsigned long el = millis() - heiStart;
+
+        // 探头"离开黑块"要连续离开 HEI_EXIT_MS 才算数，中途闪一下不算
+        if(q == 111) heiLeaveStart = 0;
+        else if(heiLeaveStart == 0) heiLeaveStart = millis();
+
+        bool reallyLeft = (heiLeaveStart != 0 && millis() - heiLeaveStart >= HEI_EXIT_MS);
+
+        // 没走满 3 秒、也还没真离开 → 继续直行（这期间不看循迹读数）
+        if(el < HEI_DURATION && !(el > HEI_MIN_MS && reallyLeft))
+        {
+            qian();
+            return;
+        }
+
+        // ★ 本段收工：走满 3s，或确认已经离开黑块
+        heiLocked     = false;
+        ultraLocked   = false;
+        heiLeaveStart = 0;
+        // 还压着黑块 → 重新武装，下一段继续直行（不会像老版本那样停在黑块上再也不动）
+        heiArmed = (q == 111);
+        ting();
+        return;
+    }
+
+    // ★★★ 超声波停车锁：优先级高于对正和循迹
+    //     （想改成"停车压过一切"，把这三行挪到 heiLocked 判断之前）
+    if(stopLocked)
+    {
+        ting();
+        return;
+    }
+
+    // ★★★ 黑线去抖 + 单次触发
+    if(q == 111)
+    {
+        if(!q111Active) { q111Active = true; q111Start = millis(); }
+    }
+    else
+    {
+        q111Active = false;
+        heiArmed   = true;
+    }
+
+    if(heiArmed && q111Active && (millis() - q111Start >= HEI_DEBOUNCE_MS))
+    {
+        heiArmed  = false;
+        zhiLocked = false;
+        hei();
+        qian();
+        return;
+    }
+
+    if(zhiLocked)
+    {
+        if(q == 10)
+        {
+            zhiLocked = false;
+            qian();
+            return;
+        }
+
+        bool worse    = (q == 100 || q == 1 || q == 0);
+        bool overtime = false;
+#if ZHI_TIMEOUT_MS
+        overtime = (millis() - zhiStart > ZHI_TIMEOUT_MS);
+#endif
+
+        if(worse || overtime)
+        {
+            zhiLocked = false;
+        }
+        else
+        {
+            zhi();
+            return;
+        }
+    }
+
+    switch(q)
+    {
+        case 10:   qian();   break;
+        case 100:  L();      break;
+        case 1:    R();      break;
+        case 110:  zhi();    break;
+        // ★ 111 = 黑块 → 直行（你要的 qian）。原来这里是 ting()，
+        //   一旦 hei 那段跑完还没离开黑块，车就停在黑块上再也不走了 —— 就是你说的"qian 没有了"
+        case 111:  qian();   break;
+        default:   ting();   break;
+    }
+}
+
+/* ========================= 7. 超声波 ========================= */
+void updateUltrasonic()
+{
+    static unsigned long lastTrigger = 0;
+
+    switch(ultraState)
+    {
+        case 0:  // 空闲 → 发送触发脉冲
+            if(micros() - lastTrigger > ULTRA_INTERVAL_US)
+            {
+                digitalWrite(TRIGPIN, LOW);
+                delayMicroseconds(2);
+                digitalWrite(TRIGPIN, HIGH);
+                delayMicroseconds(10);
+                digitalWrite(TRIGPIN, LOW);
+                trigTime = micros();
+                ultraState = 1;
+            }
+            break;
+
+        case 1:  // 等待回响
+            {
+                unsigned long duration = pulseIn(ECHOPIN, HIGH, ECHO_TIMEOUT_US);
+                distance = (duration > 0) ? (duration / 58.0) : 999;
+                lastTrigger = micros();
+                ultraState = 0;
+            }
+            break;
+    }
+}
+
+void STOP()
+{
+    if(ultraLocked)          // hei 执行中，不响应超声波停车
+    {
+        stopLocked = false;
+        return;
+    }
+
+    static int clearCnt = 0;
+
+    if(distance <= STOP_MAX)
+    {
+        clearCnt   = 0;
+        stopLocked = true;
+        ting();
+    }
+    else if(stopLocked)
+    {
+        if(++clearCnt >= STOP_CLEAR_COUNT) stopLocked = false;
+    }
+    else
+    {
+        clearCnt = 0;
+    }
+}
+
+/* ========================= 8. 串口调参 ========================= */
+void applyCmd(String c)
+{
+    char k = toupper(c.charAt(0));
+
+    if(k >= 'A' && k <= 'Z')
+    {
+        double v = c.substring(1).toFloat();
+        if      (k == 'P') kp        = v;
+        else if (k == 'I') ki        = v;
+        else if (k == 'D') kd        = v;
+        else if (k == 'T') turnSpeed = v;
+        else if (k == 'Z') zhiDelta  = v;
+        else if (k == 'S') baseSpeed = v;
+        else { Serial.println(F("# unknown cmd")); return; }
+
+        pidL.setGains(kp, ki, kd);
+        pidR.setGains(kp, ki, kd);
+        Serial.print(F("# set ")); Serial.print(k);
+        Serial.print(F(" = "));    Serial.println(v, 2);
+    }
+    else
+    {
+        baseSpeed = c.toFloat();
+        Serial.print(F("# baseSpeed = ")); Serial.println(baseSpeed, 2);
+    }
+}
+
+void handleSerial()
+{
+    static String cmd = "";
+    while(Serial.available() > 0)
+    {
+        char ch = (char)Serial.read();
+        if(ch == '\n' || ch == '\r')
+        {
+            cmd.trim();
+            if(cmd.length() > 0) applyCmd(cmd);
+            cmd = "";
+        }
+        else if(cmd.length() < 12)
+        {
+            cmd += ch;
+        }
+    }
+}
+
+/* ========================= 9. setup / loop ========================= */
+void setup()
+{
+    Serial.begin(115200);
+
+    // 循迹传感器
+    pinMode(A4, INPUT);
+    pinMode(3,  INPUT);
+    pinMode(A5, INPUT);
+
+    // 电机
+    pinMode(5,  OUTPUT);
+    pinMode(6,  OUTPUT);
+    pinMode(9,  OUTPUT);
+    pinMode(10, OUTPUT);
+
+    // 超声波
+    pinMode(TRIGPIN, OUTPUT);
+    pinMode(ECHOPIN, INPUT);
+
+    // ★ 编码器：A2/A3 走引脚变化中断
+    //   PCMSK1 这组里还有 A4/A5（循迹传感器），所以只放行 PCINT10(A2)、PCINT11(A3)，
+    //   循迹信号不会来插一脚
+    pinMode(A2, INPUT_PULLUP);
+    pinMode(A3, INPUT_PULLUP);
+    delay(2);            // 等上拉稳定，再去读初始电平，免得第一个假跳变被计入
+    pcLast  = PINC;
+    PCMSK1 |= _BV(PCINT10) | _BV(PCINT11);
+    PCICR  |= _BV(PCIE1);
+
+    pidL.setGains(kp, ki, kd);
+    pidR.setGains(kp, ki, kd);
+    motorLR(0, 0);
+
+    Serial.println(F("# PID car ready: num=baseSpeed, P/I/D=gains, T=turnSpeed, Z=zhiDelta"));
+}
+
+void loop()
+{
+    // ① 读循迹传感器
+    a = digitalRead(A4);
+    b = digitalRead(3);
+    c = digitalRead(A5);
+
+    // ② 串口调参（非阻塞）
+    handleSerial();
+
+    // ③ 超声波测距 + 停车判定（放在运动指令之前，同轮内先立锁再决策）
+    updateUltrasonic();
+    STOP();
+
+    // ④ 状态机：只决定"目标速度"，不直接写 PWM
+    du();
+    move_tai();
+
+    // ⑤ 速度环：测速 → PID → PWM（内部按 20ms 节拍执行）
+    updateSpeedPID();
+
+    // ⑥ 调试输出，100ms 一次
+    //    q,stop,tgtL,tgtR,spdL,spdR,pwmL,pwmR,dist,cmL,cmR
+    static unsigned long lastPrint = 0;
+    if(millis() - lastPrint > 100)
+    {
+        lastPrint = millis();
+
+        // ★ 里程也是 4 字节、中断在写，打印前快照一下，免得你看到假的小数
+        long cl, cr;
+        noInterrupts();
+        cl = encCntL; cr = encCntR;
+        interrupts();
+
+        Serial.print(q);                 Serial.print(',');
+        Serial.print(stopLocked);        Serial.print(',');
+        Serial.print(tgtL, 0);           Serial.print(',');
+        Serial.print(tgtR, 0);           Serial.print(',');
+        Serial.print(spdL, 1);           Serial.print(',');
+        Serial.print(spdR, 1);           Serial.print(',');
+        Serial.print(pwmOutL);           Serial.print(',');
+        Serial.print(pwmOutR);           Serial.print(',');
+        Serial.print(distance, 1);       Serial.print(',');
+        Serial.print(cl * CM_PER_EDGE, 1); Serial.print(',');
+        Serial.println(cr * CM_PER_EDGE, 1);
+    }
+}

@@ -1,0 +1,362 @@
+#include <math.h>
+
+#define TRIGPIN 14
+#define ECHOPIN 15
+
+int y = 0;
+int a = 0, b = 0, c = 0;
+int q = 0;
+int fq = 0;
+int threshold = 1;
+int u = 0;
+
+bool heiLocked = false;
+unsigned long heiStart = 0;
+
+// ★★★ 黑线（hei）触发策略
+#define HEI_DURATION    1000UL   // 黑线直行时长上限（原 3000，正是那 3 秒延迟的来源）
+#define HEI_DEBOUNCE_MS 50       // 111 必须连续保持这么久，才认定为真黑线
+#define HEI_MIN_MS      150      // hei 最短执行时间，避免刚进就退
+#define HEI_EARLY_EXIT  1        // 黑线从探头下消失就提前收工（0 = 关，死等满 HEI_DURATION）
+
+bool          heiArmed   = true;   // 允许触发黑线；离开 111 后自动重新武装
+bool          q111Active = false;  // 当前是否连续处于 111
+unsigned long q111Start  = 0;      // 本次连续 111 的起点
+
+bool zhiLocked = false;
+
+// ★ 超声波状态锁：hei(y) 动作执行期间上锁，动作完成后解锁
+bool ultraLocked = false;
+
+// ★ 超声波停车窗口（厘米）：距离落在 [STOP_MIN, STOP_MAX] 内即停车
+#define STOP_MIN 13
+#define STOP_MAX 17
+
+// ★★★ 响应速度参数
+#define ECHO_TIMEOUT_US   1200UL   // 20cm 处回波约 1.16ms，超时只需盖住停车窗口（原 3000us）
+#define ULTRA_INTERVAL_US 20000UL  // 每 20ms 测一次超声波（原 10ms）
+#define ZHI_TIMEOUT_MS    400      // 对正最长持续时间（原 1200），超时自动解锁（0 = 关闭）
+
+// ★ 非阻塞超声波状态机
+volatile unsigned long echoStart = 0;
+volatile float distance = 999;
+int ultraState = 0;  // 0=空闲 1=等待回响
+unsigned long trigTime = 0;
+
+unsigned long zhiStart = 0;   // ★ 对正开始时刻，用于超时兜底
+
+void qian();
+void hou();
+void L();
+void R();
+void hei(int i);
+void zhi();
+void ting();
+
+void du()
+{
+    if      (b == 1 && a == 0 && c == 0)  q = 10;
+    else if (a == 0 && b == 0 && c == 0)  q = fq;
+    else if (a == 1 && b == 0 && c == 0)  q = 100;
+    else if (a == 0 && b == 0 && c == 1)  q = 1;
+    else if (a == 0 && b == 1 && c == 1)  q = 1;
+    else if (a == 1 && b == 1 && c == 0)  q = 110;
+    else if (a == 1 && b == 1 && c == 1)  q = 111;
+    else                                   q = 0;
+}
+
+void move_tai()
+{
+    // ★ 优先级：hei > zhi
+    if(heiLocked)
+    {
+        unsigned long el = millis() - heiStart;
+
+        if(el < HEI_DURATION)
+        {
+#if HEI_EARLY_EXIT
+            // ★ 黑线已经从探头下走掉 → 立刻收工，不用死等满 HEI_DURATION
+            if(el > HEI_MIN_MS && q != 111)
+            {
+                heiLocked   = false;
+                ultraLocked = false;
+                heiArmed    = false;   // 必须重新"离开→再进入"才能再次触发
+                return;                // 下一轮交给 switch(q) 正常处理
+            }
+#endif
+            qian();
+            return;
+        }
+        else
+        {
+            heiLocked   = false;
+            ultraLocked = false;
+            heiArmed    = false;
+            ting();
+            return;
+        }
+    }
+
+    // ★★★ 黑线去抖 + 单次触发
+    //   原来只要某一轮 loop 恰好读到 111 就立刻锁死一整个 HEI_DURATION，
+    //   中间探头(D3)只要有一瞬间读成 1，就会出现"卡 3 秒"的假象。
+    if(q == 111)
+    {
+        if(!q111Active) { q111Active = true; q111Start = millis(); }
+    }
+    else
+    {
+        q111Active = false;
+        heiArmed   = true;             // 黑线离开探头，重新武装
+    }
+
+    // ★ 黑线优先级最高：可抢占正在进行的对正(zhi)
+    if(heiArmed && q111Active && (millis() - q111Start >= HEI_DEBOUNCE_MS))
+    {
+        heiArmed  = false;             // 一次触发只认一次，必须离开过才能再触发
+        zhiLocked = false;
+        hei(y);
+        qian();
+        return;
+    }
+
+    if(zhiLocked)
+    {
+        // ★ 已回到线上 → 立刻恢复直行
+        if(q == 10)
+        {
+            zhiLocked = false;
+            qian();
+            return;
+        }
+
+        // ★★★ 关键修正：偏离变大就立刻让位
+        //   物理上 10 → 100 必然经过 110（外侧探头先压线、中间探头后离开），
+        //   而 110 会锁上 zhiLocked；旧代码的这个锁不认 100，于是车会一直
+        //   原地对正、直到碰巧转回 q==10 才解锁——这就是那几秒的延迟。
+        bool worse = (q == 100 || q == 1 || q == 0);
+        bool overtime = false;
+#if ZHI_TIMEOUT_MS
+        overtime = (millis() - zhiStart > ZHI_TIMEOUT_MS);
+#endif
+
+        if(worse || overtime)
+        {
+            zhiLocked = false;   // 解锁，落到下面的 switch 按当前 q 立即处理
+        }
+        else
+        {
+            zhi();               // 仍处于 110，继续对正
+            return;
+        }
+    }
+
+    switch(q)
+    {
+        case 10:   qian();   break;
+        case 100:  L();      break;
+        case 1:    R();      break;
+        case 110:  zhi();    break;
+        case 111:  ting();   break;   // ★ 去抖确认中 / 已触发过未重新武装 → 先停住，看清读数
+        default:   ting();   break;
+    }
+}
+
+void qian()
+{
+    analogWrite(10, 255);
+    analogWrite(9, 0);
+    analogWrite(6, 255);
+    analogWrite(5, 0);
+}
+
+void hou()
+{
+    analogWrite(10, 0);
+    analogWrite(9, 255);
+    analogWrite(6, 0);
+    analogWrite(5, 255);
+}
+
+void L()
+{
+    analogWrite(10, 255);
+    analogWrite(9, 0);
+    analogWrite(5, 255);
+    analogWrite(6, 0);
+}
+
+void R()
+{
+    analogWrite(10, 0);
+    analogWrite(9, 255);
+    analogWrite(6, 255);
+    analogWrite(5, 0);
+}
+
+void zhi()
+{
+    if(!zhiLocked) { zhiLocked = true; zhiStart = millis(); }
+    analogWrite(10, 255);
+    analogWrite(9, 0);
+    analogWrite(6, 0);
+    analogWrite(5,200 );
+}
+
+void ting()
+{
+    analogWrite(10, 0);
+    analogWrite(9, 0);
+    analogWrite(6, 0);
+    analogWrite(5, 0);
+}
+
+void hei(int i)
+{
+    if(!heiLocked)
+    {
+        heiLocked = true;
+        heiStart = millis();
+    }
+    ultraLocked = true;   // ★ 上锁：hei(y) 动作期间屏蔽超声波停车
+}
+
+// ★★★ 非阻塞超声波：不等待，分段执行
+void updateUltrasonic()
+{
+    static unsigned long lastTrigger = 0;
+
+    switch(ultraState)
+    {
+        case 0:  // 空闲 → 发送触发脉冲
+            if(micros() - lastTrigger > ULTRA_INTERVAL_US)
+            {
+                digitalWrite(TRIGPIN, LOW);
+                delayMicroseconds(2);
+                digitalWrite(TRIGPIN, HIGH);
+                delayMicroseconds(10);
+                digitalWrite(TRIGPIN, LOW);
+                trigTime = micros();
+                ultraState = 1;
+            }
+            break;
+
+        case 1:  // 等待回响 → 非阻塞读取
+            {
+                // ★ 超时压到 1200us：20cm 以外的回波直接判为"无障碍"，
+                //   阻塞时间从 3ms 降到 1.2ms，循迹传感器不再被长时间饿着
+                unsigned long duration = pulseIn(ECHOPIN, HIGH, ECHO_TIMEOUT_US);
+                if(duration > 0)
+                {
+                    distance = duration / 58.0;
+                }
+                else
+                {
+                    distance = 999;  // 超时 = 无障碍
+                }
+                lastTrigger = micros();
+                ultraState = 0;
+            }
+            break;
+    }
+}
+
+void STOP()
+{
+    // ★ 超声波状态锁生效中（hei(y) 正在执行）→ 不响应超声波停车
+    if(ultraLocked)
+    {
+        u = 0;
+        return;
+    }
+
+    // ★ 距离处于 13~17cm 窗口内 → 停车
+    if(distance >= STOP_MIN && distance <= STOP_MAX)
+    {
+        ting();
+        heiLocked = false;
+        zhiLocked = false;
+        u++;
+        if(u >= 3) u = 0;
+    }
+    else
+    {
+        u = 0;
+    }
+}
+
+void setup()
+{
+    Serial.begin(115200);        // ★ 提高波特率，减少串口耗时
+    Serial.setTimeout(3);        // ★ 3ms 超时
+
+    pinMode(3, INPUT);
+    pinMode(A5, INPUT);
+    pinMode(A4, INPUT);
+    pinMode(5, OUTPUT);
+    pinMode(6, OUTPUT);
+    pinMode(9, OUTPUT);
+    pinMode(10, OUTPUT);
+    pinMode(TRIGPIN, OUTPUT);
+    pinMode(ECHOPIN, INPUT);
+}
+
+void loop()
+{
+    // ① 读传感器（< 1ms）
+    a = digitalRead(A4);
+    b = digitalRead(3);
+    c = digitalRead(A5);
+
+    // ② 串口（★ 改成非阻塞逐字节累积，不再因 readStringUntil 卡 3ms）
+    static String cmd = "";
+    while(Serial.available() > 0)
+    {
+        char ch = (char)Serial.read();
+        if(ch == '\n')
+        {
+            cmd.trim();
+            if(cmd.length() > 0)
+            {
+                threshold = cmd.toInt();
+                y = threshold;
+            }
+            cmd = "";
+        }
+        else if(ch != '\r' && cmd.length() < 12)
+        {
+            cmd += ch;
+        }
+    }
+
+    // ③ 状态判断 + 执行（< 1ms）
+    du();
+    move_tai();
+
+    // ④ 超声波（阻塞已从 3ms 降到 ≤1.2ms）
+    updateUltrasonic();
+    STOP();
+
+    // ⑤ 调试输出：100ms 一次，带上黑线武装状态和超声波距离
+    //    格式：a,b,c,q,zhiLocked,heiLocked,heiArmed,distance
+    static unsigned long lastPrint = 0;
+    if(millis() - lastPrint > 100)
+    {
+        lastPrint = millis();
+        Serial.print(a);
+        Serial.print(",");
+        Serial.print(b);
+        Serial.print(",");
+        Serial.print(c);
+        Serial.print(",");
+        Serial.print(q);
+        Serial.print(",");
+        Serial.print(zhiLocked);
+        Serial.print(",");
+        Serial.print(heiLocked);
+        Serial.print(",");
+        Serial.print(heiArmed);
+        Serial.print(",");
+        Serial.println(distance, 1);
+    }
+}

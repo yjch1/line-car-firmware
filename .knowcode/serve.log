@@ -1,0 +1,19 @@
+[KnowCode] Starting daemon & file watcher in C:\Users\MECHREUO\Desktop\2...
+[KnowCode] Starting FalkorDB embedded database in C:\Users\MECHREUO\Desktop\2\.knowcode...
+[KnowCode] Stopping KnowCode daemon...
+[KnowCode] KnowCode daemon stopped cleanly.
+[KnowCode Serve Error]: Error: [KnowCode] Embedded FalkorDB binaries are not supported natively on Windows (Redis 7.2+ and GraphBLAS require a POSIX environment).
+Recommended solutions for Windows users:
+  1. Run inside WSL2 (Ubuntu on Windows) - fully supported with embedded Linux binaries!
+  2. Run FalkorDB in Docker: 'docker run -d -p 6379:6379 falkordb/falkordb:latest' and set customUrl/falkordbUrl to 'redis://127.0.0.1:6379'
+  3. Connect to a remote FalkorDB instance via FALKORDB_URL.
+    at FalkorDBManager.start (file:///C:/Users/MECHREUO/.dsh/profiles/desktop/node_modules/dsh-knowcode/lib/db/falkor-manager.js:84:23)
+    at KnowCodeDaemon.startInner (file:///C:/Users/MECHREUO/.dsh/profiles/desktop/node_modules/dsh-knowcode/lib/server/daemon.js:193:56)
+    at KnowCodeDaemon.start (file:///C:/Users/MECHREUO/.dsh/profiles/desktop/node_modules/dsh-knowcode/lib/server/daemon.js:162:31)
+    at runServeCommand (file:///C:/Users/MECHREUO/.dsh/profiles/desktop/node_modules/dsh-knowcode/lib/cli/serve-cmd.js:21:29)
+    at Command.<anonymous> (file:///C:/Users/MECHREUO/.dsh/profiles/desktop/node_modules/dsh-knowcode/bin/knowcode.js:50:13)
+    at Command.listener [as _actionHandler] (C:\Users\MECHREUO\.dsh\profiles\desktop\node_modules\dsh-knowcode\node_modules\commander\lib\command.js:552:17)
+    at C:\Users\MECHREUO\.dsh\profiles\desktop\node_modules\dsh-knowcode\node_modules\commander\lib\command.js:1586:14
+    at Command._chainOrCall (C:\Users\MECHREUO\.dsh\profiles\desktop\node_modules\dsh-knowcode\node_modules\commander\lib\command.js:1470:12)
+    at Command._parseCommand (C:\Users\MECHREUO\.dsh\profiles\desktop\node_modules\dsh-knowcode\node_modules\commander\lib\command.js:1585:27)
+    at C:\Users\MECHREUO\.dsh\profiles\desktop\node_modules\dsh-knowcode\node_modules\commander\lib\command.js:1349:27
