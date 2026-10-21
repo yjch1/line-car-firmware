@@ -1,0 +1,24 @@
+# ============================================================================
+#  换行符统一为 LF —— 对本项目是硬要求，不是风格偏好
+#  ---------------------------------------------------------------------------
+#  本机【系统级】git 配置里 core.autocrlf=true（C:\Program Files\Git\etc\gitconfig），
+#  如果没有这个文件，git 每次 checkout 都会把 .ino 从 LF 改成 CRLF：
+#      · 文件字节数变化（2.ino 2672 行会多出 2672 字节）；
+#      · 和 Arduino IDE 里的存档、以及历史快照的 diff 全部整文件变红；
+#      · "回退到某个版本"不再等于"文件恢复到那个字节数"。
+#  这里用仓库级规则把它钉死，优先级高于任何全局/系统设置。
+# ============================================================================
+* text=auto eol=lf
+
+*.ino       text eol=lf
+*.ino.bak   text eol=lf
+*.md        text eol=lf
+*.py        text eol=lf
+*.txt       text eol=lf
+.gitignore  text eol=lf
+
+# 二进制文件不做任何转换
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.pdf   binary
