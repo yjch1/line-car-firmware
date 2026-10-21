@@ -69,6 +69,17 @@ ATmega328P：flash 32KB、**SRAM 仅 2KB**。静态占用约 370B，余量充足
 
 定时器分配：Timer0 = micros/millis + 左电机 PWM（不可动）；Timer1 = 右电机 PWM（不可动）；Timer2 = 舵机；PCINT1 = 编码器 + 超声波 ECHO（A0 = PC0 = PCINT8）。
 
+## 读代码请省 token（**这一节直接决定开销**）
+
+- `ultrasonic.ino` / `whisker.ino` 各约 **2700 行 / 13 万字符**，整篇读一次就吃掉大量上下文预算。
+  **先 grep 定位符号，再局部读**：`STOP(`、`updateUltrasonic`、`move_tai`、`ULTRA_ARM_DELAY_MS`、
+  `ultraArmed`、`stage` —— 然后用 `offset`/`limit` 只取那 80~150 行。
+- `archive/` 里 4 个 `.ino` 合计约 **52 万字符，不要整篇读**。要对比参数演进就 `grep '#define'`，
+  要对比某段逻辑就 `grep -A/-B` 取上下文。
+- `项目理解文档.md` 20KB，只在需要背景时读，且**结论一律以代码为准**（它描述的版本已经过时）。
+- 需要"能不能编过"的结论时，直接跑 `tools\build.ps1`，不要自己拼 avr-g++ 参数 —— 那会白烧一轮。
+- 改完只重编受影响的单条线：`... -File tools\build.ps1 ultrasonic`。
+
 ## 当前未解问题（优先处理）
 
 **超声波线：测距小于 22cm 时不判停。**
